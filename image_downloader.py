@@ -10,7 +10,10 @@ Sources
                  (4-band red, green, blue, near infrared)
   planetary      Microsoft Planetary Computer (STAC, no account)
                  collections: sentinel-2-l2a, sentinel-1-rtc, sentinel-1-grd,
-                 landsat-c2-l2, sentinel-3-* netcdf, sentinel-5p-l2-netcdf
+                 landsat-c2-l2, MODIS Collection 6.1 (GPP, LAI/FPAR,
+                 250 m reflectance, 250 m vegetation indices), HLS v2.0,
+                 sentinel-3-* netcdf, sentinel-5p-l2-netcdf,
+                 JRC Global Surface Water
   cdse           Copernicus Data Space Ecosystem (OData, full products,
                  free account; set CDSE_USER and CDSE_PASSWORD env variables)
                  collections: SENTINEL-1, SENTINEL-2, SENTINEL-3, SENTINEL-5P,
@@ -21,6 +24,10 @@ Sources
                  noaa-naip is the newest USDA NAIP dataset in the coastal mosaic
                  The start and end dates are used as a year range. Download
                  writes a GeoTIFF of the area of interest.
+  usgs           USGS 3DEP lidar (no account), the catalogue behind
+                 https://apps.nationalmap.gov/lidar-explorer/#/
+                 collections: lidar-lpc (LAZ tiles), lidar-projects (work units)
+                 Dates filter tile publication or project collection dates.
 
 Landsat Collection 2 Level-2 searches are limited to Landsat 8 and Landsat 9.
 Sentinel-5 (UVNS on MetOp-SG) is not in these catalogues; use Sentinel-5P.
@@ -51,6 +58,10 @@ Examples
       --bbox -76.6 42.4 -76.4 42.5 --start 2026-06-01 --end 2026-09-30 \
       --cloud 20 --bands red green blue nir --out ls89_ithaca
 
+  # USGS 3DEP lidar point cloud tiles (LAZ) around Charleston
+  python image_downloader.py search --source usgs --collection lidar-lpc \
+      --bbox -79.95 32.75 -79.85 32.82 --start 2010-01-01 --end 2026-10-15 --limit 5
+
   # Full Sentinel-2 L2A SAFE products from Copernicus
   export CDSE_USER=you@example.com CDSE_PASSWORD=...
   python image_downloader.py download --source cdse --collection SENTINEL-2 \
@@ -71,7 +82,7 @@ import math
 import os
 import sys
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from xml.etree import ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -103,7 +114,17 @@ DEFAULT_COLLECTION = {
     "planetary": "sentinel-2-l2a",
     "cdse": "SENTINEL-2",
     "noaa": "noaa-rgb8",
+    "usgs": "lidar-lpc",
 }
+
+# USGS 3DEP lidar. The index is the same service Lidar Explorer draws, and the
+# tiles are the LAZ files the National Map download API publishes.
+# https://apps.nationalmap.gov/lidar-explorer/#/
+LIDAR_EXPLORER = "https://apps.nationalmap.gov/lidar-explorer/#/"
+LIDAR_INDEX = ("https://index.nationalmap.gov/arcgis/rest/services/"
+               "3DEPElevationIndex/MapServer/24/query")
+TNM_PRODUCTS = "https://tnmaccess.nationalmap.gov/api/v1/products"
+LIDAR_COLLECTIONS = ("lidar-lpc", "lidar-projects")
 
 # NOAA Digital Coast mosaics served by the Data Access Viewer imagery services.
 # https://coast.noaa.gov/dataviewer/#/imagery/search
@@ -155,6 +176,67 @@ LS_ALIASES = {
     "nir": "nir08", "nir08": "nir08", "swir16": "swir16", "swir22": "swir22",
     "lwir": "lwir11", "lwir11": "lwir11", "qa": "qa_pixel", "qa_pixel": "qa_pixel",
     "qa_aerosol": "qa_aerosol", "qa_radsat": "qa_radsat",
+}
+
+# Planetary Computer collections whose asset keys are not the band names
+# shown in the app. Values are the STAC asset keys.
+PLANETARY_BANDS = {
+    "modis-17A2H-061": {
+        "gpp": "Gpp_500m",
+        "net_photosynthesis": "PsnNet_500m",
+        "qc": "Psn_QC_500m",
+    },
+    "modis-15A2H-061": {
+        "lai": "Lai_500m",
+        "fpar": "Fpar_500m",
+        "lai_sd": "LaiStdDev_500m",
+        "fpar_sd": "FparStdDev_500m",
+        "qc": "FparLai_QC",
+    },
+    "modis-09Q1-061": {
+        "red": "sur_refl_b01",
+        "nir": "sur_refl_b02",
+        "qc": "sur_refl_qc_250m",
+        "state": "sur_refl_state_250m",
+    },
+    "modis-13Q1-061": {
+        "ndvi": "250m_16_days_NDVI",
+        "evi": "250m_16_days_EVI",
+        "red": "250m_16_days_red_reflectance",
+        "nir": "250m_16_days_NIR_reflectance",
+        "blue": "250m_16_days_blue_reflectance",
+        "mir": "250m_16_days_MIR_reflectance",
+        "quality": "250m_16_days_VI_Quality",
+        "reliability": "250m_16_days_pixel_reliability",
+    },
+    "hls2-s30": {
+        "coastal": "B01", "blue": "B02", "green": "B03", "red": "B04",
+        "rededge1": "B05", "rededge2": "B06", "rededge3": "B07",
+        "nir": "B08", "nir08": "B8A", "swir16": "B11", "swir22": "B12",
+        "fmask": "Fmask",
+    },
+    "hls2-l30": {
+        "coastal": "B01", "blue": "B02", "green": "B03", "red": "B04",
+        "nir": "B05", "swir16": "B06", "swir22": "B07",
+        "cirrus": "B09", "lwir": "B10", "lwir2": "B11", "fmask": "Fmask",
+    },
+    "jrc-gsw": {
+        "occurrence": "occurrence",
+        "change": "change",
+        "seasonality": "seasonality",
+        "recurrence": "recurrence",
+        "transitions": "transitions",
+        "extent": "extent",
+    },
+}
+PLANETARY_DEFAULT_BANDS = {
+    "modis-17A2H-061": ["gpp", "net_photosynthesis"],
+    "modis-15A2H-061": ["lai", "fpar"],
+    "modis-09Q1-061": ["red", "nir"],
+    "modis-13Q1-061": ["ndvi", "evi", "red", "nir"],
+    "hls2-s30": ["red", "green", "blue", "nir"],
+    "hls2-l30": ["red", "green", "blue", "nir"],
+    "jrc-gsw": ["occurrence", "extent"],
 }
 
 CDSE_TOKEN_URL = ("https://identity.dataspace.copernicus.eu/auth/realms/CDSE/"
@@ -247,7 +329,8 @@ def _rfc3339_range(start, end) -> str:
 
 
 def _supports_cloud(collection: str) -> bool:
-    return collection.startswith("sentinel-2") or collection == "landsat-c2-l2"
+    return (collection.startswith("sentinel-2") or collection == "landsat-c2-l2"
+            or collection.startswith("hls2-"))
 
 
 def stac_search(source, collection, aoi: AOI, start, end, cloud, limit,
@@ -260,6 +343,10 @@ def stac_search(source, collection, aoi: AOI, start, end, cloud, limit,
         max_items=limit,
         sortby=[{"field": "properties.datetime", "direction": "asc"}],
     )
+    # JRC Global Surface Water is one 1984–2020 mosaic per tile. A recent
+    # date window does not overlap it.
+    if collection == "jrc-gsw":
+        params.pop("datetime")
     query = {}
     if cloud is not None and _supports_cloud(collection):
         query["eo:cloud_cover"] = {"lte": cloud}
@@ -276,7 +363,13 @@ def stac_search(source, collection, aoi: AOI, start, end, cloud, limit,
     except Exception:  # some APIs reject sortby; retry without it
         params.pop("sortby")
         items = list(client.search(**params).items())
-    return sorted(items, key=lambda i: i.datetime or 0)
+    for item in items:
+        # Composites publish a range. pystac writes properties.datetime from
+        # item.datetime, so copy the interval start onto the item itself.
+        if item.datetime is None and (item.properties or {}).get("start_datetime"):
+            item.datetime = datetime.fromisoformat(
+                item.properties["start_datetime"].replace("Z", "+00:00"))
+    return sorted(items, key=lambda i: i.datetime.isoformat() if i.datetime else "")
 
 
 def naip_search(aoi: AOI, limit):
@@ -439,6 +532,9 @@ def resolve_bands(source, collection, bands):
         return {b: LS_ALIASES.get(b.lower(), b) for b in bands}
     if collection.startswith("sentinel-1"):
         return {b: b.lower() for b in bands}  # vv, vh, hh, hv
+    if collection in PLANETARY_BANDS:
+        table = PLANETARY_BANDS[collection]
+        return {b: table.get(b, b) for b in bands}
     return {b: b for b in bands}  # native asset keys (Sentinel-3, Sentinel-5P)
 
 
@@ -519,7 +615,7 @@ def _browser_href(asset: dict) -> str | None:
 def browse_href(item: dict) -> str | None:
     """Public thumbnail URL for a STAC item, when the catalogue publishes one."""
     assets = item.get("assets") or {}
-    for key in ("thumbnail", "rendered_preview", "reduced_resolution_browse", "preview"):
+    for key in ("thumbnail", "browse", "rendered_preview", "reduced_resolution_browse", "preview"):
         href = _browser_href(assets.get(key) or {})
         if href:
             return href
@@ -609,7 +705,8 @@ def to_https(href: str) -> str:
     return href
 
 
-def http_download(url: str, dst: Path, session=None, headers=None, desc=None):
+def http_download(url: str, dst: Path, session=None, headers=None, desc=None,
+                  timeout=120):
     """Stream a URL to disk with resume support."""
     session = session or requests.Session()
     tmp = dst.with_name(dst.name + ".part")
@@ -617,7 +714,7 @@ def http_download(url: str, dst: Path, session=None, headers=None, desc=None):
     hdrs = dict(headers or {})
     if pos:
         hdrs["Range"] = f"bytes={pos}-"
-    with session.get(url, headers=hdrs, stream=True, timeout=120) as r:
+    with session.get(url, headers=hdrs, stream=True, timeout=timeout) as r:
         if r.status_code == 416:  # already complete
             tmp.replace(dst)
             return
@@ -1021,6 +1118,343 @@ class NOAA:
         return dst, note
 
 
+# --------------------------------------------------------------------------- #
+# USGS 3DEP lidar
+# --------------------------------------------------------------------------- #
+def _iso_day(value) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)[:10]
+
+
+def _ms_day(ms) -> str | None:
+    if not ms:
+        return None
+    try:
+        when = datetime.fromtimestamp(int(ms) / 1000, timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+    return when.strftime("%Y-%m-%d")
+
+
+def _box_polygon(bounds: dict) -> dict | None:
+    try:
+        x0, y0 = float(bounds["minX"]), float(bounds["minY"])
+        x1, y1 = float(bounds["maxX"]), float(bounds["maxY"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"type": "Polygon", "coordinates": [[
+        [x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]]}
+
+
+def _esri_polygon(geometry: dict) -> dict | None:
+    rings = (geometry or {}).get("rings") or []
+    polygons = []
+    for ring in rings:
+        coords = [[float(pt[0]), float(pt[1])] for pt in ring if len(pt) >= 2]
+        if len(coords) < 4:
+            continue
+        if coords[0] != coords[-1]:
+            coords.append(coords[0])
+        polygons.append([coords])
+    if not polygons:
+        return None
+    if len(polygons) == 1:
+        return {"type": "Polygon", "coordinates": polygons[0]}
+    return {"type": "MultiPolygon", "coordinates": polygons}
+
+
+def _intersects(aoi: AOI, geometry: dict | None) -> bool:
+    if not geometry or not aoi.geometry:
+        return True
+    from shapely.geometry import shape
+
+    try:
+        return shape(aoi.geometry).intersects(shape(geometry))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+class USGS:
+    """Search and download USGS 3DEP lidar. No account is required."""
+
+    def search(self, collection, aoi: AOI, start, end, limit):
+        if collection == "lidar-projects":
+            return self.search_projects(aoi, start, end, limit)
+        if collection == "lidar-lpc":
+            return self.search_tiles(aoi, start, end, limit)
+        raise ValueError(
+            f"Unknown USGS collection {collection!r}. "
+            f"Choose one of: {', '.join(LIDAR_COLLECTIONS)}")
+
+    def search_tiles(self, aoi: AOI, start, end, limit, text=None,
+                     url_contains=None):
+        """LAZ tiles whose footprint meets the area, newest publication first."""
+        want = max(1, int(limit))
+        found, offset, total = [], 0, None
+        while offset < 500:
+            page = self._products(aoi, start, end, text, 50, offset)
+            items = page.get("items") or []
+            total = page.get("total")
+            if not items:
+                break
+            for item in items:
+                row = self._tile_row(item, total)
+                if row is None:
+                    continue
+                url = row["lidar"]["download"]
+                if url_contains and url_contains not in url:
+                    continue
+                if not _intersects(aoi, row["geometry"]):
+                    continue
+                found.append(row)
+            offset += len(items)
+            if total is not None and offset >= int(total):
+                break
+        found.sort(key=lambda row: row["properties"].get("datetime") or "",
+                   reverse=True)
+        chosen = found[:want]
+        if chosen and (len(found) > want or (total and offset < int(total))):
+            for row in chosen:
+                row["properties"]["truncated"] = True
+        return chosen
+
+    def search_projects(self, aoi: AOI, start, end, limit):
+        """3DEP lidar work units that were collected in the date range."""
+        want = max(1, int(limit))
+        start_day, end_day = _iso_day(start), _iso_day(end)
+        if end_day < start_day:
+            start_day, end_day = end_day, start_day
+        where = (f"collect_start <= DATE '{end_day}' AND "
+                 f"collect_end >= DATE '{start_day}'")
+        minx, miny, maxx, maxy = aoi.bbox
+        found, offset = [], 0
+        more = False
+        while len(found) < want and offset < 5000:
+            data = self._index({
+                "where": where,
+                "geometry": f"{minx},{miny},{maxx},{maxy}",
+                "geometryType": "esriGeometryEnvelope",
+                "inSR": "4326",
+                "spatialRel": "esriSpatialRelIntersects",
+                "outFields": ("workunit,project,ql,spec,p_method,collect_start,"
+                              "collect_end,lpc_pub_date,lpc_link,metadata_link,"
+                              "lpc_category,horiz_crs,vert_crs,geoid"),
+                "returnGeometry": "true",
+                "outSR": "4326",
+                "orderByFields": "collect_start DESC",
+                "resultRecordCount": 100,
+                "resultOffset": offset,
+                "f": "json",
+            })
+            features = data.get("features") or []
+            if not features:
+                break
+            for feat in features:
+                row = self._project_row(feat)
+                if row and _intersects(aoi, row["geometry"]):
+                    found.append(row)
+                    if len(found) >= want:
+                        break
+            offset += len(features)
+            more = bool(data.get("exceededTransferLimit"))
+            if not more:
+                break
+        if len(found) >= want and more:
+            for row in found:
+                row["properties"]["truncated"] = True
+        self._attach_previews(found, aoi)
+        return found
+
+    def download(self, scene, aoi: AOI, out: Path, tile_limit=8):
+        """Save one LAZ tile, or the tiles of one project that meet the area."""
+        info = scene.get("lidar") or {}
+        out.mkdir(parents=True, exist_ok=True)
+        if info.get("kind") == "project":
+            return self._download_project(scene, aoi, out, tile_limit)
+        path = self._save_tile(info.get("download") or "", out)
+        return [path], ""
+
+    def _download_project(self, scene, aoi: AOI, out: Path, tile_limit):
+        info = scene["lidar"]
+        workunit = info["workunit"]
+        tiles = self.search_tiles(
+            aoi, "1990-01-01", _iso_day(date.today()), max(1, int(tile_limit)),
+            text=workunit, url_contains=f"/{workunit}/")
+        paths = []
+        for tile in tiles:
+            paths.append(self._save_tile(tile["lidar"]["download"], out))
+        record = {
+            "workunit": workunit,
+            "project": info.get("project"),
+            "quality": info.get("quality"),
+            "collected": scene["properties"].get("datetime"),
+            "point_cloud": info.get("folder"),
+            "metadata": info.get("metadata"),
+            "explorer": LIDAR_EXPLORER,
+            "tiles": [path.name for path in paths],
+        }
+        (out / f"{safe_name(workunit)}.json").write_text(json.dumps(record, indent=1))
+        note = f"{workunit}: saved {len(paths)} LAZ tile(s) that meet this area."
+        if info.get("folder"):
+            note += f" The rest of the project is at {info['folder']}"
+        return paths, note
+
+    def _save_tile(self, url: str, out: Path) -> Path:
+        from urllib.parse import unquote, urlparse
+
+        if not url:
+            raise RuntimeError("This lidar result has no download link.")
+        name = safe_name(unquote(urlparse(url).path.rsplit("/", 1)[-1])) or "lidar.laz"
+        dst = out / name
+        if dst.exists() and dst.stat().st_size > 0:
+            return dst
+        # rockyweb often accepts the connection slowly, then streams steadily.
+        try:
+            http_download(url, dst, timeout=(30, 180))
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                "USGS did not finish sending this LAZ file from rockyweb.usgs.gov. "
+                "Try the download again in a moment."
+            ) from exc
+        return dst
+
+    def _products(self, aoi: AOI, start, end, text, page, offset):
+        minx, miny, maxx, maxy = aoi.bbox
+        params = {
+            "datasets": "Lidar Point Cloud (LPC)",
+            "bbox": f"{minx},{miny},{maxx},{maxy}",
+            "prodFormats": "LAZ",
+            "max": int(page),
+            "offset": int(offset),
+            "outputFormat": "JSON",
+        }
+        if start and end:
+            params["dateType"] = "Publication"
+            params["start"] = _iso_day(start)
+            params["end"] = _iso_day(end)
+        if text:
+            params["q"] = text
+        response = requests.get(TNM_PRODUCTS, params=params, timeout=90)
+        response.raise_for_status()
+        data = response.json()
+        errors = data.get("errors") or []
+        if errors:
+            raise RuntimeError("; ".join(str(err) for err in errors))
+        return data
+
+    def _index(self, params):
+        response = requests.get(LIDAR_INDEX, params=params, timeout=90)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("error"):
+            message = data["error"].get("message") or str(data["error"])
+            raise RuntimeError(message)
+        return data
+
+    def _tile_row(self, item, total):
+        url = item.get("downloadLazURL") or item.get("downloadURL")
+        bounds = _box_polygon(item.get("boundingBox") or {})
+        if not url or bounds is None:
+            return None
+        from urllib.parse import unquote, urlparse
+
+        name = unquote(urlparse(url).path.rsplit("/", 1)[-1])
+        published = (item.get("publicationDate") or "")[:10]
+        size = item.get("sizeInBytes") or 0
+        return {
+            "id": safe_name(name) or safe_name(item.get("title") or "lidar"),
+            "geometry": bounds,
+            "properties": {
+                "datetime": f"{published}T00:00:00Z" if published else None,
+                "title": item.get("title") or name,
+                "format": item.get("format") or "LAZ",
+                "size_mb": round(size / 1e6, 1),
+                "catalogue_total": total,
+            },
+            "lidar": {
+                "kind": "tile",
+                "download": url,
+                "preview": item.get("previewGraphicURL"),
+                "metadata": item.get("metaUrl") or item.get("vendorMetaUrl"),
+            },
+        }
+
+    def _project_row(self, feature):
+        attr = feature.get("attributes") or {}
+        workunit = attr.get("workunit")
+        if not workunit:
+            return None
+        collected = _ms_day(attr.get("collect_start"))
+        return {
+            "id": safe_name(str(workunit)),
+            "geometry": _esri_polygon(feature.get("geometry") or {}),
+            "properties": {
+                "datetime": f"{collected}T00:00:00Z" if collected else None,
+                "title": workunit,
+                "project": attr.get("project"),
+                "quality": attr.get("ql"),
+                "specification": attr.get("spec"),
+                "method": attr.get("p_method"),
+                "category": attr.get("lpc_category"),
+                "published": _ms_day(attr.get("lpc_pub_date")),
+            },
+            "lidar": {
+                "kind": "project",
+                "workunit": workunit,
+                "project": attr.get("project"),
+                "quality": attr.get("ql"),
+                "folder": attr.get("lpc_link"),
+                "metadata": attr.get("metadata_link"),
+                "preview": None,
+            },
+        }
+
+    def _attach_previews(self, rows, aoi: AOI):
+        if not rows:
+            return
+
+        def one(row):
+            workunit = row["lidar"]["workunit"]
+            try:
+                page = self._products(aoi, None, None, workunit, 8, 0)
+            except (requests.RequestException, RuntimeError, ValueError):
+                return None
+            fallback = None
+            for item in page.get("items") or []:
+                preview = item.get("previewGraphicURL")
+                if not preview:
+                    continue
+                url = item.get("downloadLazURL") or item.get("downloadURL") or ""
+                if f"/{workunit}/" in url:
+                    return preview
+                fallback = fallback or preview
+            return fallback
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            previews = list(pool.map(one, rows))
+        for row, preview in zip(rows, previews):
+            row["lidar"]["preview"] = preview
+
+
+def print_lidar_table(rows):
+    if rows and (rows[0].get("lidar") or {}).get("kind") == "project":
+        print(f"{'#':>3}  {'collected':<12} {'quality':<8}  work unit")
+        for i, row in enumerate(rows, 1):
+            props = row["properties"]
+            when = (props.get("datetime") or "")[:10]
+            print(f"{i:3}  {when:<12} {props.get('quality') or '-':<8}  "
+                  f"{props.get('title')}")
+        return
+    print(f"{'#':>3}  {'published':<12} {'MB':>8}  tile")
+    for i, row in enumerate(rows, 1):
+        props = row["properties"]
+        when = (props.get("datetime") or "")[:10]
+        print(f"{i:3}  {when:<12} {props.get('size_mb') or 0:8}  {props.get('title')}")
+
+
 def print_noaa_table(rows):
     print(f"{'#':>3}  {'year':<6} {'res m':>6} {'tiles':>6}  dataset")
     for i, row in enumerate(rows, 1):
@@ -1067,7 +1501,7 @@ def write_summary(out: Path, items, failures):
 # --------------------------------------------------------------------------- #
 def build_parser():
     p = argparse.ArgumentParser(
-        description="Search and download Sentinel, Landsat, and NOAA coastal imagery.",
+        description="Search and download Sentinel, Landsat, NOAA imagery, and USGS 3DEP lidar.",
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog=__doc__.split("Examples")[1].split("Install")[0]
                                 if "Examples" in __doc__ else None)
@@ -1075,10 +1509,10 @@ def build_parser():
 
     def common(sp):
         sp.add_argument("--source",
-                        choices=["earth-search", "planetary", "cdse", "noaa"],
+                        choices=["earth-search", "planetary", "cdse", "noaa", "usgs"],
                         default="earth-search")
         sp.add_argument("--collection", help="default: sentinel-2-l2a (STAC) / "
-                        "SENTINEL-2 (cdse) / noaa-rgb8 (noaa)")
+                        "SENTINEL-2 (cdse) / noaa-rgb8 (noaa) / lidar-lpc (usgs)")
         g = sp.add_mutually_exclusive_group(required=True)
         g.add_argument("--bbox", nargs=4, type=float,
                        metavar=("MINLON", "MINLAT", "MAXLON", "MAXLAT"))
@@ -1165,6 +1599,33 @@ def main(argv=None):
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 print(f"  ✗ {row['id']}: {exc}", file=sys.stderr)
+        return 1 if failed else 0
+
+    if args.source == "usgs":
+        rows = USGS().search(collection, aoi, args.start, args.end, args.limit)
+        if not rows:
+            print("No USGS 3DEP lidar meets this area and date range.")
+            return 0
+        print_lidar_table(rows)
+        if args.cmd == "search":
+            if args.json:
+                Path(args.json).write_text(json.dumps(rows, indent=1))
+            return 0
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        usgs = USGS()
+        failed = 0
+        for row in rows:
+            label = row["properties"].get("title") or row["id"]
+            try:
+                paths, note = retry(lambda row=row: usgs.download(
+                    row, aoi, out, args.limit), what=label)
+                print(f"  ✓ {', '.join(str(path) for path in paths)}")
+                if note:
+                    print(f"    {note}")
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                print(f"  ✗ {label}: {exc}", file=sys.stderr)
         return 1 if failed else 0
 
     if args.source == "earth-search" and collection == "naip":

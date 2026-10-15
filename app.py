@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import shutil
 import zipfile
@@ -24,12 +25,14 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from folium.plugins import Draw
+from shapely.affinity import translate
 from shapely.geometry import mapping, shape
 from streamlit_folium import st_folium
 
 import image_downloader as sd
 
 LOGO = Path(__file__).with_name("pygis_logo.png")
+UPATTA_LOGO = Path(__file__).with_name("upatta_logo.png")
 # Half of the size previously shown in the sidebar.
 LOGO_WIDTH = 130
 st.set_page_config(page_title="PyGIS Explorer", page_icon=str(LOGO), layout="wide")
@@ -87,15 +90,18 @@ COLLECTIONS = {
     "earth-search": ["sentinel-2-l2a", "sentinel-2-l1c", "landsat-c2-l2", "naip"],
     "planetary": [
         "sentinel-2-l2a", "sentinel-1-rtc", "sentinel-1-grd", "landsat-c2-l2",
-        "sentinel-3-olci-lfr-l2-netcdf", "sentinel-3-olci-wfr-l2-netcdf",
-        "sentinel-3-slstr-lst-l2-netcdf", "sentinel-3-slstr-wst-l2-netcdf",
-        "sentinel-3-slstr-frp-l2-netcdf", "sentinel-3-synergy-syn-l2-netcdf",
-        "sentinel-3-synergy-aod-l2-netcdf", "sentinel-3-synergy-vg1-l2-netcdf",
-        "sentinel-5p-l2-netcdf",
+        "modis-17A2H-061", "modis-15A2H-061", "modis-09Q1-061", "modis-13Q1-061",
+        "hls2-s30", "hls2-l30",
+        "sentinel-3-synergy-vg1-l2-netcdf", "sentinel-3-olci-lfr-l2-netcdf",
+        "sentinel-3-slstr-lst-l2-netcdf", "sentinel-3-olci-wfr-l2-netcdf",
+        "sentinel-3-slstr-wst-l2-netcdf", "sentinel-3-slstr-frp-l2-netcdf",
+        "sentinel-3-synergy-syn-l2-netcdf", "sentinel-3-synergy-aod-l2-netcdf",
+        "sentinel-5p-l2-netcdf", "jrc-gsw",
     ],
     "cdse": ["SENTINEL-2", "SENTINEL-1", "SENTINEL-3", "SENTINEL-5P",
              "LANDSAT-8", "LANDSAT-9"],
     "noaa": ["noaa-rgb8", "noaa-rgb16", "noaa-rgbn8", "noaa-cir8", "noaa-naip"],
+    "usgs": ["lidar-lpc", "lidar-projects"],
 }
 COLLECTION_LABELS = {
     "sentinel-2-l2a": "Sentinel-2 L2A",
@@ -104,15 +110,22 @@ COLLECTION_LABELS = {
     "sentinel-1-grd": "Sentinel-1 GRD",
     "landsat-c2-l2": "Landsat 8–9 Collection 2 L2",
     "naip": "USDA NAIP (latest)",
-    "sentinel-3-olci-lfr-l2-netcdf": "Sentinel-3 OLCI land colour",
-    "sentinel-3-olci-wfr-l2-netcdf": "Sentinel-3 OLCI water colour",
-    "sentinel-3-slstr-lst-l2-netcdf": "Sentinel-3 land surface temperature",
+    "modis-17A2H-061": "MODIS Gross Primary Productivity 8-Day",
+    "modis-15A2H-061": "MODIS Leaf Area Index/FPAR 8-Day",
+    "modis-09Q1-061": "MODIS Surface Reflectance 8-Day (250m)",
+    "modis-13Q1-061": "MODIS Vegetation Indices 16-Day (250m)",
+    "hls2-s30": "HLS v2.0, Sentinel-2",
+    "hls2-l30": "HLS v2.0, Landsat",
+    "sentinel-3-synergy-vg1-l2-netcdf": "Sentinel-3 1-Day Surface Reflectance and NDVI (SPOT VEGETATION)",
+    "sentinel-3-olci-lfr-l2-netcdf": "Sentinel-3 Land (Full Resolution)",
+    "sentinel-3-slstr-lst-l2-netcdf": "Sentinel-3 Land Surface Temperature",
+    "sentinel-3-olci-wfr-l2-netcdf": "Sentinel-3 Water (Full Resolution)",
     "sentinel-3-slstr-wst-l2-netcdf": "Sentinel-3 sea surface temperature",
     "sentinel-3-slstr-frp-l2-netcdf": "Sentinel-3 fire radiative power",
     "sentinel-3-synergy-syn-l2-netcdf": "Sentinel-3 synergy reflectance",
     "sentinel-3-synergy-aod-l2-netcdf": "Sentinel-3 synergy aerosol",
-    "sentinel-3-synergy-vg1-l2-netcdf": "Sentinel-3 daily NDVI",
     "sentinel-5p-l2-netcdf": "Sentinel-5P Level-2",
+    "jrc-gsw": "JRC Global Surface Water",
     "SENTINEL-2": "Sentinel-2",
     "SENTINEL-1": "Sentinel-1",
     "SENTINEL-3": "Sentinel-3",
@@ -124,6 +137,8 @@ COLLECTION_LABELS = {
     "noaa-rgbn8": "Color and near infrared, 8-bit",
     "noaa-cir8": "Color infrared, 8-bit",
     "noaa-naip": "USDA NAIP (latest)",
+    "lidar-lpc": "Lidar point cloud (LAZ)",
+    "lidar-projects": "Lidar projects",
 }
 CDSE_TYPES = {
     "SENTINEL-2": ["S2MSI2A", "S2MSI1C"],
@@ -191,8 +206,16 @@ def mission(collection: str) -> str:
         return "s5p"
     if c.startswith("noaa"):
         return "noaa"
+    if c.startswith("lidar"):
+        return "lidar"
     if c == "naip":
         return "naip"
+    if c.startswith("modis-"):
+        return "modis"
+    if c.startswith("hls2-"):
+        return "hls"
+    if c == "jrc-gsw":
+        return "jrc"
     return "s2"
 
 ss = st.session_state
@@ -347,6 +370,13 @@ def search_noaa(collection, geom_json, start, end, limit):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def search_usgs(collection, geom_json, start, end, limit):
+    geom = json.loads(geom_json)
+    aoi = sd.AOI(tuple(shape(geom).bounds), geom)
+    return sd.USGS().search(collection, aoi, start, end, limit)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def search_cdse(collection, geom_json, start, end, cloud, ptype, limit,
                 s1_mode, s1_pol, s1_orbit):
     geom = json.loads(geom_json)
@@ -437,6 +467,36 @@ def scene_cards(results, source, aoi):
                 "image": sd.NOAA().preview_url(item, aoi),
             })
             continue
+        if source == "usgs":
+            props = item["properties"]
+            info = item.get("lidar") or {}
+            size = props.get("size_mb")
+            if info.get("kind") == "project":
+                caption = " · ".join(
+                    part for part in (
+                        props.get("quality") or "",
+                        (props.get("datetime") or "")[:10],
+                        props.get("method") or "",
+                    ) if part
+                )
+            else:
+                caption = " · ".join(
+                    part for part in (
+                        (props.get("datetime") or "")[:10],
+                        f"{size:.0f} MB" if isinstance(size, (int, float)) else "",
+                        "LAZ",
+                    ) if part
+                )
+            cards.append({
+                "id": item["id"],
+                "title": props.get("title") or item["id"],
+                "caption": caption,
+                "image": info.get("preview"),
+                "link": info.get("download") or info.get("metadata") or info.get("folder"),
+                "link_label": ("Download this LAZ from USGS" if info.get("download")
+                               else "Open the project folder"),
+            })
+            continue
         props = item.get("properties") or {}
         when = (props.get("datetime") or "")[:10]
         cloud = props.get("eo:cloud_cover")
@@ -478,6 +538,9 @@ def show_scene_browser(results, source, aoi):
     if source == "noaa":
         st.caption("Each thumbnail is this dataset over the area you drew. "
                    "Choose one to view it larger.")
+    elif source == "usgs":
+        st.caption("USGS browse images for the lidar in this search. "
+                   "Choose one to view it larger.")
     else:
         st.caption("Thumbnails of the scenes in this search. Choose one to view it.")
     ids = [card["id"] for card in cards]
@@ -506,6 +569,8 @@ def show_scene_browser(results, source, aoi):
     st.markdown(f"##### {chosen['title']}")
     if chosen["caption"]:
         st.caption(chosen["caption"])
+    if chosen.get("link"):
+        st.markdown(f"[{chosen.get('link_label') or 'Open the National Map record'}]({chosen['link']})")
     if chosen["image"] is not None:
         left, _right = st.columns([3, 2])
         with left:
@@ -549,12 +614,13 @@ def zip_folder(folder: Path) -> bytes:
 with st.sidebar:
     st.image(LOGO, width=LOGO_WIDTH)
     st.title("PyGIS Explorer")
-    st.caption("Search and download Sentinel, Landsat, and NOAA coastal imagery.")
+    st.caption("Search and download Sentinel, Landsat, NOAA imagery, and USGS lidar.")
     source = st.selectbox("Source", list(COLLECTIONS),
                           format_func={"earth-search": "Earth Search (AWS)",
                                        "planetary": "Planetary Computer",
                                        "cdse": "Copernicus (CDSE)",
-                                       "noaa": "NOAA Digital Coast"}.get)
+                                       "noaa": "NOAA Digital Coast",
+                                       "usgs": "USGS 3DEP Lidar"}.get)
     collection = st.selectbox("Collection", COLLECTIONS[source],
                               format_func=lambda c: COLLECTION_LABELS.get(c, c))
     kind = mission(collection)
@@ -562,18 +628,27 @@ with st.sidebar:
     is_netcdf = "netcdf" in collection
 
     c1, c2 = st.columns(2)
-    start = c1.date_input("Start", date.today() - timedelta(days=60))
-    end = c2.date_input("End", date.today())
+    if source == "usgs":
+        start = c1.date_input("Start", date(2000, 1, 1), key="lidar-start")
+        end = c2.date_input("End", date.today(), key="lidar-end")
+    else:
+        start = c1.date_input("Start", date.today() - timedelta(days=60))
+        end = c2.date_input("End", date.today())
     cloud = None
-    if kind in ("s2", "landsat"):
+    if kind in ("s2", "landsat", "hls"):
         cloud = st.slider("Max cloud cover (%)", 0, 100, 20)
-    if collection == "naip":
+    if collection == "naip" or collection == "lidar-lpc":
         limit_label = "Max tiles"
+    elif collection == "lidar-projects":
+        limit_label = "Max projects"
     elif source == "noaa":
         limit_label = "Max datasets"
     else:
         limit_label = "Max scenes"
-    limit = st.number_input(limit_label, 1, 500, 30)
+    if source == "usgs":
+        limit = st.number_input(limit_label, 1, 40, 8)
+    else:
+        limit = st.number_input(limit_label, 1, 500, 30)
     if collection in ("naip", "noaa-naip"):
         st.caption("USDA NAIP uses the newest year available for this area.")
 
@@ -630,6 +705,52 @@ with st.sidebar:
                 "Download saves a GeoTIFF of that area. Large areas are resampled "
                 "so the image stays within NOAA's export size limit. Coverage is coastal."
             )
+    elif source == "usgs":
+        mode = "full"
+        if collection == "lidar-projects":
+            st.caption(
+                "USGS 3DEP lidar projects from "
+                "[Lidar Explorer](https://apps.nationalmap.gov/lidar-explorer/#/). "
+                "No account is required. Each row is a project whose collection "
+                "dates meet the range above and whose footprint meets the area. "
+                "Download saves the LAZ tiles from that project inside the area, "
+                "up to the max you set, plus a small file of the project links."
+            )
+        else:
+            st.caption(
+                "USGS 3DEP lidar point clouds from "
+                "[Lidar Explorer](https://apps.nationalmap.gov/lidar-explorer/#/). "
+                "No account is required. Each row is one LAZ tile published in "
+                "the date range. Tiles are often 20–80 MB."
+            )
+    elif kind in ("modis", "hls", "jrc"):
+        table = sd.PLANETARY_BANDS[collection]
+        bands = st.multiselect(
+            "Layers" if kind == "jrc" else "Bands",
+            list(table), default=sd.PLANETARY_DEFAULT_BANDS[collection],
+            key=f"pc-bands-{collection}")
+        if kind == "jrc":
+            mode = "clip"
+            st.caption(
+                "JRC Global Surface Water from Planetary Computer. "
+                "Each tile is the 1984–2020 mosaic, so the start and end dates "
+                "are not used. Download clips the selected layers to the area you drew."
+            )
+        else:
+            mode = st.radio("Download mode", ["clip", "full"], horizontal=True,
+                            help="clip = only your area (small, fast); full = whole tile")
+            stack = st.checkbox("Also write a multi-band stack.tif", value=kind == "hls",
+                                disabled=mode != "clip")
+            if kind == "modis":
+                st.caption(
+                    "MODIS Collection 6.1 from Planetary Computer. No account is "
+                    "required. Terra and Aqua tiles are both included."
+                )
+            else:
+                st.caption(
+                    "Harmonized Landsat and Sentinel-2 (HLS) version 2.0 from "
+                    "Planetary Computer."
+                )
     elif kind == "naip":
         bands = ["red", "green", "blue", "nir"]
         mode = "clip"
@@ -708,6 +829,11 @@ with st.sidebar:
         ss._clear_aoi = True
         st.rerun()
 
+    with st.container(key="upatta_credit", horizontal=True,
+                      vertical_alignment="center", gap="small"):
+        st.image(UPATTA_LOGO, width=64, alt="Upatta Data Analytics")
+        st.markdown("**Zia Ahmed, PhD**")
+
 
 # --------------------------------------------------------------------------- #
 # Map
@@ -717,6 +843,26 @@ st.markdown(
     <style>
     .pygis-hero h1 { font-size: 1.7rem; font-weight: 750; margin: 0; letter-spacing: -0.03em; }
     .pygis-hero p { margin: 0.15rem 0 0.8rem 0; color: #4d5d6e; }
+    [data-testid="stSidebarUserContent"] {
+        overflow-y: auto;
+        max-height: calc(100vh - 156px);
+        box-sizing: border-box;
+    }
+    .st-key-upatta_credit {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: auto;
+        box-sizing: border-box;
+        margin: 0;
+        padding: 4px 12px 6px;
+        background: #ffffff;
+        border-top: 1px solid rgba(20, 32, 51, 0.12);
+        z-index: 1000001;
+    }
+    .st-key-upatta_credit p { margin: 0; }
+    [data-testid="stSidebar"][data-collapsed="true"] .st-key-upatta_credit { display: none; }
     </style>
     <div class="pygis-hero">
       <h1><span style="color:#d4920b">Py</span>GIS Explorer</h1>
@@ -725,13 +871,31 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+def wrap_geometry(geom: dict) -> dict:
+    """Move a drawing that landed on the next copy of the world back to -180..180."""
+    bounds = shape(geom).bounds
+    minx, maxx = bounds[0], bounds[2]
+    shift = 0.0
+    if minx > 180:
+        shift = -360.0 * math.ceil((minx - 180) / 360)
+    elif maxx < -180:
+        shift = 360.0 * math.ceil((-180 - maxx) / 360)
+    if not shift:
+        return geom
+    return mapping(translate(shape(geom), xoff=shift))
+
+
 st.markdown("### Map")
+if ss.aoi_geom:
+    fixed = wrap_geometry(ss.aoi_geom)
+    if fixed != ss.aoi_geom:
+        ss.aoi_geom = fixed
 center = [42.44, -76.50]
 if ss.aoi_geom:
     c = shape(ss.aoi_geom).centroid
     center = [c.y, c.x]
 m = folium.Map(location=center, zoom_start=11 if ss.aoi_geom else 7,
-               tiles=None, control_scale=True)
+               tiles=None, control_scale=True, max_bounds=True)
 folium.TileLayer(
     tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
     attr="Esri World Imagery", name="Satellite", overlay=False, show=True).add_to(m)
@@ -758,9 +922,11 @@ folium.LayerControl(collapsed=True).add_to(m)
 map_out = st_folium(m, height=430, use_container_width=True,
                     returned_objects=["last_active_drawing"])
 drawn = (map_out or {}).get("last_active_drawing")
-if drawn and drawn.get("geometry") and drawn["geometry"] != ss.aoi_geom:
-    ss.aoi_geom = drawn["geometry"]
-    st.rerun()
+if drawn and drawn.get("geometry"):
+    geom = wrap_geometry(drawn["geometry"])
+    if geom != ss.aoi_geom:
+        ss.aoi_geom = geom
+        st.rerun()
 
 if ss.aoi_geom:
     b = shape(ss.aoi_geom).bounds
@@ -773,7 +939,11 @@ if collection in ("naip", "noaa-naip"):
 # --------------------------------------------------------------------------- #
 # Search
 # --------------------------------------------------------------------------- #
-if st.button("🔎 Search scenes", type="primary", disabled=not ss.aoi_geom):
+if source == "usgs":
+    search_label = "🔎 Search lidar"
+else:
+    search_label = "🔎 Search scenes"
+if st.button(search_label, type="primary", disabled=not ss.aoi_geom):
     gj = json.dumps(ss.aoi_geom)
     with st.spinner("Searching…"):
         try:
@@ -783,6 +953,9 @@ if st.button("🔎 Search scenes", type="primary", disabled=not ss.aoi_geom):
                                          s1_mode, s1_pol, s1_orbit)
             elif source == "noaa":
                 ss.results = search_noaa(collection, gj, str(start), str(end),
+                                         int(limit))
+            elif source == "usgs":
+                ss.results = search_usgs(collection, gj, str(start), str(end),
                                          int(limit))
             elif collection == "naip":
                 ss.results = search_naip(gj, int(limit))
@@ -818,6 +991,12 @@ if not ss.results:
     elif source == "noaa":
         st.warning("No NOAA coastal imagery intersects this area and year range. "
                    "Coverage is coastal — try a shoreline area or a wider range of years.")
+    elif source == "usgs":
+        st.warning("No 3DEP lidar meets this area and date range. "
+                   "Widen the dates or try another area. Many projects were "
+                   "collected years ago.")
+    elif collection == "jrc-gsw":
+        st.warning("No JRC Global Surface Water tile covers this area.")
     else:
         st.warning("No scenes found — widen the dates or raise the cloud limit.")
     st.stop()
@@ -839,6 +1018,30 @@ if ss.results_source == "noaa":
             "sensor": props.get("sensor"),
             "id": d["id"],
         })
+    df = pd.DataFrame(rows)
+elif ss.results_source == "usgs":
+    rows = []
+    lidar_kind = (ss.results[0].get("lidar") or {}).get("kind")
+    for d in ss.results:
+        props = d["properties"]
+        if lidar_kind == "project":
+            rows.append({
+                "download": True,
+                "collected": (props.get("datetime") or "")[:10],
+                "quality": props.get("quality"),
+                "project": props.get("project"),
+                "work unit": props.get("title"),
+                "method": props.get("method"),
+                "id": d["id"],
+            })
+        else:
+            rows.append({
+                "download": True,
+                "published": (props.get("datetime") or "")[:10],
+                "size MB": props.get("size_mb"),
+                "tile": props.get("title"),
+                "id": d["id"],
+            })
     df = pd.DataFrame(rows)
 elif ss.results_source == "cdse":
     rows = []
@@ -880,8 +1083,20 @@ else:
     df = pd.DataFrame(rows)
 
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Datasets" if ss.results_source == "noaa" else "Scenes", len(df))
-if ss.results_source == "noaa":
+if ss.results_source == "usgs":
+    k1.metric("Projects" if "work unit" in df.columns else "Tiles", len(df))
+else:
+    k1.metric("Datasets" if ss.results_source == "noaa" else "Scenes", len(df))
+if ss.results_source == "usgs":
+    if "size MB" in df.columns and df["size MB"].notna().any():
+        k2.metric("Listed size", f"{df['size MB'].sum():.0f} MB")
+    if "collected" in df.columns and df["collected"].astype(str).str.strip().any():
+        k4.metric("Collected", f"{df['collected'].min()} → {df['collected'].max()}")
+    elif "published" in df.columns and df["published"].astype(str).str.strip().any():
+        k4.metric("Published", f"{df['published'].min()} → {df['published'].max()}")
+    if ss.results and (ss.results[0].get("properties") or {}).get("truncated"):
+        st.caption("More lidar meets this area than the list shows. Raise the max to see it.")
+elif ss.results_source == "noaa":
     finest = df["resolution m"].dropna()
     if not finest.empty:
         k2.metric("Finest resolution", f"{finest.min():g} m")
@@ -897,7 +1112,12 @@ else:
 
 left, right = st.columns([3, 2])
 with left:
-    st.markdown("#### Datasets" if ss.results_source == "noaa" else "#### Scenes")
+    if ss.results_source == "usgs" and "work unit" in df.columns:
+        st.markdown("#### Projects")
+    elif ss.results_source == "usgs":
+        st.markdown("#### Tiles")
+    else:
+        st.markdown("#### Datasets" if ss.results_source == "noaa" else "#### Scenes")
     cloud_config = {}
     if "cloud %" in df.columns:
         cloud_config["cloud %"] = st.column_config.ProgressColumn(
@@ -906,7 +1126,19 @@ with left:
                             disabled=[c for c in df.columns if c != "download"],
                             column_config=cloud_config)
 with right:
-    if ss.results_source == "noaa":
+    if ss.results_source == "usgs" and "size MB" in df.columns:
+        st.markdown("#### Tile size")
+        fig = px.bar(df, x="published", y="size MB", hover_name="tile", height=330)
+        fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), xaxis_title=None)
+        st.plotly_chart(fig, width="stretch")
+    elif ss.results_source == "usgs":
+        st.markdown("#### Quality levels")
+        counts = df["quality"].fillna("Unknown").value_counts().reset_index()
+        counts.columns = ["quality", "projects"]
+        fig = px.bar(counts, x="quality", y="projects", height=330)
+        fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), xaxis_title=None)
+        st.plotly_chart(fig, width="stretch")
+    elif ss.results_source == "noaa":
         st.markdown("#### Tiles in the area")
         chart = df.assign(year=df["year"].map(lambda y: str(int(y)) if pd.notna(y) else ""))
         fig = px.bar(chart, x="year", y="tiles", hover_name="dataset", height=330)
@@ -930,7 +1162,14 @@ show_scene_browser(ss.results, ss.results_source, sd.AOI(
     tuple(shape(ss.aoi_geom).bounds), ss.aoi_geom))
 
 selected = edited[edited["download"]]
-noun = "dataset(s)" if ss.results_source == "noaa" else "scene(s)"
+if ss.results_source == "noaa":
+    noun = "dataset(s)"
+elif ss.results_source == "usgs" and "work unit" in df.columns:
+    noun = "project(s)"
+elif ss.results_source == "usgs":
+    noun = "tile(s)"
+else:
+    noun = "scene(s)"
 st.markdown(f"**{len(selected)} {noun} selected**")
 
 
@@ -973,6 +1212,24 @@ if st.button("⬇️ Download selected", type="primary", disabled=selected.empty
             bar.progress(i / len(chosen), text=f"{i}/{len(chosen)} datasets")
         ss.last_run = {"dir": str(run_dir), "cdse": False, "mode": "full",
                        "noaa": True, "notes": notes}
+    elif ss.results_source == "usgs":
+        chosen = [d for d in ss.results if d["id"] in set(selected["id"])]
+        usgs = sd.USGS()
+        bar = st.progress(0.0, text="Downloading USGS lidar…")
+        notes = []
+        for i, d in enumerate(chosen, 1):
+            title = d["properties"].get("title") or d["id"]
+            try:
+                _paths, note = sd.retry(
+                    lambda d=d: usgs.download(d, aoi, run_dir, int(limit)),
+                    what=title)
+                if note:
+                    notes.append(note)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"{title}: {e}")
+            bar.progress(i / len(chosen), text=f"{i}/{len(chosen)} lidar downloads")
+        ss.last_run = {"dir": str(run_dir), "cdse": False, "mode": "full",
+                       "usgs": True, "notes": notes}
     elif ss.results and ss.results[0].get("collection") == "naip":
         chosen = [d for d in ss.results if d["id"] in set(selected["id"])]
         with st.spinner(f"Clipping {len(chosen)} NAIP tile(s)…"):
@@ -1060,8 +1317,10 @@ if run:
                     if (d_ / "red.tif").exists() and (d_ / "nir.tif").exists():
                         it = json.loads((d_ / "item.json").read_text())
                         nd = ndvi(d_, it, band_map)
-                        if nd is not None and np.isfinite(nd).any():
-                            rows.append({"date": it["properties"]["datetime"][:10],
+                        props = it.get("properties") or {}
+                        when = props.get("datetime") or props.get("start_datetime") or ""
+                        if nd is not None and np.isfinite(nd).any() and when:
+                            rows.append({"date": str(when)[:10],
                                          "mean NDVI": float(np.nanmean(nd))})
                 if rows:
                     f = px.line(pd.DataFrame(rows).sort_values("date"), x="date",
