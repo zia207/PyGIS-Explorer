@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+pygis_runs/
+.venv/
+*.part
